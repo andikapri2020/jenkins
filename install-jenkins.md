@@ -23,7 +23,7 @@ version: '3.8'
 
 services:
   jenkins:
-    image: jenkins/jenkins:lts
+    image: jenkins/jenkins:2.555.3-lts-jdk21
     container_name: jenkins
     restart: unless-stopped
     privileged: true
@@ -185,7 +185,7 @@ spec:
         runAsUser: 1000
       containers:
         - name: jenkins
-          image: jenkins/jenkins:lts
+          image: jenkins/jenkins:2.555.3-lts-jdk21
           ports:
             - containerPort: 8080
               name: http
@@ -312,7 +312,7 @@ kubectl create namespace jenkins
 # values.yaml
 controller:
   image: "jenkins/jenkins"
-  tag: "lts"
+  tag: "2.555.3-lts-jdk21"
   
   resources:
     requests:
@@ -329,12 +329,12 @@ controller:
   adminPassword: "admin123"  # ganti dengan password yang kuat
 
   installPlugins:
-    - kubernetes:latest
-    - workflow-aggregator:latest
-    - git:latest
-    - configuration-as-code:latest
-    - blueocean:latest
-    - docker-workflow:latest
+    - kubernetes:4423.vb_59f230b_ce53
+    - workflow-aggregator:608.v67378e9d3db_1
+    - git:5.10.1
+    - configuration-as-code:2089.v970a_0b_a_8cc6d
+    - blueocean:1.27.25
+    - docker-workflow:634.vedc7242b_eda_7
 
   JCasC:
     enabled: true
@@ -477,7 +477,7 @@ spec:
     maxParallelAgents: 10  # maksimal 10 agent pod berjalan bersamaan
     containers:
       - name: jenkins-master
-        image: jenkins/jenkins:lts
+        image: jenkins/jenkins:2.555.3-lts-jdk21
         imagePullPolicy: Always
         resources:
           limits:
@@ -495,19 +495,19 @@ spec:
 
     plugins:
       - name: kubernetes
-        version: "latest"
+        version: "4423.vb_59f230b_ce53"
       - name: workflow-job
-        version: "latest"
+        version: "1581.ve4b_d0db_fcb_b_b_"
       - name: workflow-aggregator
-        version: "latest"
+        version: "608.v67378e9d3db_1"
       - name: git
-        version: "latest"
+        version: "5.10.1"
       - name: job-dsl
-        version: "latest"
+        version: "3654.vdf58f53e2d15"
       - name: configuration-as-code
-        version: "latest"
+        version: "2089.v970a_0b_a_8cc6d"
       - name: blueocean
-        version: "latest"
+        version: "1.27.25"
 
   seedJobs:
     - id: jenkins-operator
@@ -657,7 +657,7 @@ data:
               label: "jenkins-agent"
               containers:
                 - name: "jnlp"
-                  image: "jenkins/inbound-agent:latest"
+                  image: "jenkins/inbound-agent:3383.vc8881d4b_0e76-1-jdk21"
                   resourceRequestCpu: "200m"
                   resourceRequestMemory: "256Mi"
                   resourceLimitCpu: "500m"
