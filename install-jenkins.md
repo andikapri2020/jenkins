@@ -416,6 +416,290 @@ kubectl delete pvc -n jenkins --all
 
 ---
 
+### Backup dan Restore Manual (Helm)
+
+Jenkins yang diinstall via Helm tidak punya fitur backup otomatis. Backup dilakukan menggunakan **CronJob Kubernetes** yang upload ke S3, dan restore dilakukan manual saat dibutuhkan.
+
+#### Persiapan: Buat Secret AWS S3
+
+```yaml
+# jenkins-s3-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jenkins-aws-s3
+  namespace: jenkins
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "YOUR_ACCESS_KEY_ID"
+  AWS_SECRET_ACCESS_KEY: "YOUR_SECRET_ACCESS_KEY"
+  AWS_DEFAULT_REGION: "ap-southeast-1"
+  S3_BUCKET: "your-jenkins-backup-bucket"
+```
+
+```bash
+kubectl apply -f jenkins-s3-secret.yaml
+```
+
+#### Backup: Buat CronJob
+
+CronJob ini berjalan setiap malam pukul 02.00 dan menyimpan backup ke S3 dengan retensi 30 backup terakhir.
+
+```yaml
+# jenkins-backup-cronjob.yaml
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: jenkins-backup
+  namespace: jenkins
+spec:
+  schedule: "0 2 * * *"        # setiap hari pukul 02.00
+  concurrencyPolicy: Forbid     # jangan jalankan 2 backup sekaligus
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              image: amazon/aws-cli:2.27.8
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  set -e
+                  TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+                  BACKUP_NAME="jenkins-backup-${TIMESTAMP}.tar.gz"
+                  RETENTION_COUNT=30
+
+                  echo "[INFO] Memulai backup: ${BACKUP_NAME}"
+
+                  # Buat archive dari jenkins_home
+                  tar -czf /tmp/${BACKUP_NAME} \
+                    --exclude=/var/jenkins_home/workspace \
+                    --exclude=/var/jenkins_home/war \
+                    --exclude=/var/jenkins_home/caches \
+                    --exclude=/var/jenkins_home/logs \
+                    /var/jenkins_home
+
+                  # Upload ke S3
+                  aws s3 cp /tmp/${BACKUP_NAME} \
+                    s3://${S3_BUCKET}/jenkins/backups/${BACKUP_NAME}
+                  echo "[INFO] Upload selesai: s3://${S3_BUCKET}/jenkins/backups/${BACKUP_NAME}"
+
+                  # Hapus file temp lokal
+                  rm -f /tmp/${BACKUP_NAME}
+
+                  # Retention: hapus backup lama, sisakan 30 terakhir
+                  EXISTING=$(aws s3 ls s3://${S3_BUCKET}/jenkins/backups/ | sort | awk '{print $4}')
+                  TOTAL=$(echo "${EXISTING}" | grep -c . || true)
+
+                  if [ "${TOTAL}" -gt "${RETENTION_COUNT}" ]; then
+                    DELETE_COUNT=$((TOTAL - RETENTION_COUNT))
+                    echo "[INFO] Menghapus ${DELETE_COUNT} backup lama"
+                    echo "${EXISTING}" | head -n ${DELETE_COUNT} | while read FILE; do
+                      aws s3 rm s3://${S3_BUCKET}/jenkins/backups/${FILE}
+                      echo "[INFO] Dihapus: ${FILE}"
+                    done
+                  fi
+
+                  echo "[INFO] Backup selesai. Total: $(aws s3 ls s3://${S3_BUCKET}/jenkins/backups/ | wc -l)"
+              env:
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: jenkins-aws-s3
+                      key: AWS_ACCESS_KEY_ID
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: jenkins-aws-s3
+                      key: AWS_SECRET_ACCESS_KEY
+                - name: AWS_DEFAULT_REGION
+                  valueFrom:
+                    secretKeyRef:
+                      name: jenkins-aws-s3
+                      key: AWS_DEFAULT_REGION
+                - name: S3_BUCKET
+                  valueFrom:
+                    secretKeyRef:
+                      name: jenkins-aws-s3
+                      key: S3_BUCKET
+              resources:
+                requests:
+                  cpu: "100m"
+                  memory: "128Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"
+              volumeMounts:
+                - name: jenkins-home
+                  mountPath: /var/jenkins_home
+                  readOnly: true
+          volumes:
+            - name: jenkins-home
+              persistentVolumeClaim:
+                claimName: jenkins
+```
+
+```bash
+kubectl apply -f jenkins-backup-cronjob.yaml
+
+# Cek CronJob terdaftar
+kubectl get cronjob -n jenkins
+
+# Trigger backup manual (tanpa menunggu jadwal)
+kubectl create job --from=cronjob/jenkins-backup jenkins-backup-manual -n jenkins
+
+# Monitor progress backup
+kubectl logs -f job/jenkins-backup-manual -n jenkins
+```
+
+#### Cek daftar backup di S3
+
+```bash
+kubectl run s3-list --rm -it --restart=Never \
+  --image=amazon/aws-cli:2.27.8 \
+  --env="AWS_ACCESS_KEY_ID=YOUR_KEY" \
+  --env="AWS_SECRET_ACCESS_KEY=YOUR_SECRET" \
+  --env="AWS_DEFAULT_REGION=ap-southeast-1" \
+  -- s3 ls s3://your-jenkins-backup-bucket/jenkins/backups/ --recursive --human-readable
+```
+
+#### Restore: Dari S3 ke Jenkins
+
+> **Penting:** Matikan Jenkins dulu sebelum restore agar tidak ada konflik write ke `jenkins_home`.
+
+**Step 1 — Scale down Jenkins:**
+
+```bash
+kubectl scale deployment jenkins -n jenkins --replicas=0
+kubectl rollout status deployment/jenkins -n jenkins
+```
+
+**Step 2 — Jalankan pod restore:**
+
+```yaml
+# jenkins-restore-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: jenkins-restore
+  namespace: jenkins
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: restore
+          image: amazon/aws-cli:2.27.8
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+
+              echo "[INFO] Memulai proses restore..."
+
+              # Tampilkan daftar backup tersedia
+              echo "[INFO] Backup tersedia:"
+              aws s3 ls s3://${S3_BUCKET}/jenkins/backups/ | sort
+
+              # Ambil backup terbaru (atau set manual: BACKUP_FILE=jenkins-backup-YYYYMMDD-HHMMSS.tar.gz)
+              LATEST=$(aws s3 ls s3://${S3_BUCKET}/jenkins/backups/ | sort | tail -n 1 | awk '{print $4}')
+
+              if [ -z "${LATEST}" ]; then
+                echo "[ERROR] Tidak ada backup ditemukan!"
+                exit 1
+              fi
+
+              echo "[INFO] Restore dari: ${LATEST}"
+
+              # Download dari S3
+              aws s3 cp s3://${S3_BUCKET}/jenkins/backups/${LATEST} /tmp/${LATEST}
+
+              # Kosongkan jenkins_home dulu (kecuali folder workspace)
+              find /var/jenkins_home -mindepth 1 \
+                ! -path "/var/jenkins_home/workspace*" \
+                -delete || true
+
+              # Extract backup
+              tar -xzf /tmp/${LATEST} -C /
+
+              # Hapus file temp
+              rm -f /tmp/${LATEST}
+
+              echo "[INFO] Restore selesai dari: ${LATEST}"
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: jenkins-aws-s3
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: jenkins-aws-s3
+                  key: AWS_SECRET_ACCESS_KEY
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                secretKeyRef:
+                  name: jenkins-aws-s3
+                  key: AWS_DEFAULT_REGION
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: jenkins-aws-s3
+                  key: S3_BUCKET
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          volumeMounts:
+            - name: jenkins-home
+              mountPath: /var/jenkins_home
+      volumes:
+        - name: jenkins-home
+          persistentVolumeClaim:
+            claimName: jenkins
+```
+
+```bash
+kubectl apply -f jenkins-restore-job.yaml
+
+# Monitor proses restore
+kubectl logs -f job/jenkins-restore -n jenkins
+```
+
+**Step 3 — Nyalakan kembali Jenkins setelah restore selesai:**
+
+```bash
+kubectl scale deployment jenkins -n jenkins --replicas=1
+kubectl rollout status deployment/jenkins -n jenkins
+```
+
+**Step 4 — Bersihkan job restore:**
+
+```bash
+kubectl delete job jenkins-restore -n jenkins
+```
+
+#### Restore dari backup tertentu (bukan yang terbaru)
+
+Edit bagian ini di `jenkins-restore-job.yaml`:
+
+```bash
+# Ganti baris LATEST dengan nama file spesifik
+LATEST="jenkins-backup-20260628-020000.tar.gz"
+```
+
+---
+
 ## Metode 4: Jenkins Operator
 
 Jenkins Operator adalah Kubernetes Operator yang mengelola Jenkins secara full otomatis termasuk backup, restore, dan konfigurasi.
