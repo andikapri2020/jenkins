@@ -457,6 +457,109 @@ kubectl create secret generic jenkins-operator-credentials \
   --namespace jenkins
 ```
 
+### Step 3.1: Buat Secret untuk AWS S3
+
+```yaml
+# jenkins-s3-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: jenkins-aws-s3
+  namespace: jenkins
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "YOUR_ACCESS_KEY_ID"
+  AWS_SECRET_ACCESS_KEY: "YOUR_SECRET_ACCESS_KEY"
+  AWS_DEFAULT_REGION: "ap-southeast-1"
+  S3_BUCKET: "your-jenkins-backup-bucket"
+```
+
+```bash
+kubectl apply -f jenkins-s3-secret.yaml
+```
+
+### Step 3.2: Buat ConfigMap untuk script backup dan restore
+
+```yaml
+# jenkins-backup-scripts.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jenkins-backup-scripts
+  namespace: jenkins
+data:
+  backup.sh: |
+    #!/bin/bash
+    set -e
+
+    TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+    BACKUP_NAME="jenkins-backup-${TIMESTAMP}.tar.gz"
+    RETENTION_COUNT=30
+
+    echo "[INFO] Memulai backup: ${BACKUP_NAME}"
+
+    # Buat archive dari jenkins_home, exclude folder yang tidak penting
+    tar -czf /tmp/${BACKUP_NAME} \
+      --exclude=/var/jenkins_home/workspace \
+      --exclude=/var/jenkins_home/war \
+      --exclude=/var/jenkins_home/caches \
+      --exclude=/var/jenkins_home/logs \
+      /var/jenkins_home
+
+    # Upload ke S3
+    aws s3 cp /tmp/${BACKUP_NAME} s3://${S3_BUCKET}/jenkins/backups/${BACKUP_NAME}
+    echo "[INFO] Upload selesai: s3://${S3_BUCKET}/jenkins/backups/${BACKUP_NAME}"
+
+    # Hapus file temp lokal
+    rm -f /tmp/${BACKUP_NAME}
+
+    # Retention: hapus backup lama, sisakan RETENTION_COUNT terakhir
+    EXISTING=$(aws s3 ls s3://${S3_BUCKET}/jenkins/backups/ | sort | awk '{print $4}')
+    TOTAL=$(echo "${EXISTING}" | wc -l)
+
+    if [ "${TOTAL}" -gt "${RETENTION_COUNT}" ]; then
+      DELETE_COUNT=$((TOTAL - RETENTION_COUNT))
+      echo "[INFO] Menghapus ${DELETE_COUNT} backup lama (retention: ${RETENTION_COUNT})"
+      echo "${EXISTING}" | head -n ${DELETE_COUNT} | while read FILE; do
+        aws s3 rm s3://${S3_BUCKET}/jenkins/backups/${FILE}
+        echo "[INFO] Dihapus: ${FILE}"
+      done
+    fi
+
+    echo "[INFO] Backup selesai. Total backup: $(aws s3 ls s3://${S3_BUCKET}/jenkins/backups/ | wc -l)"
+
+  restore.sh: |
+    #!/bin/bash
+    set -e
+
+    echo "[INFO] Memulai proses restore..."
+
+    # Ambil backup terbaru dari S3
+    LATEST=$(aws s3 ls s3://${S3_BUCKET}/jenkins/backups/ | sort | tail -n 1 | awk '{print $4}')
+
+    if [ -z "${LATEST}" ]; then
+      echo "[ERROR] Tidak ada backup ditemukan di s3://${S3_BUCKET}/jenkins/backups/"
+      exit 1
+    fi
+
+    echo "[INFO] Restore dari backup: ${LATEST}"
+
+    # Download dari S3
+    aws s3 cp s3://${S3_BUCKET}/jenkins/backups/${LATEST} /tmp/${LATEST}
+
+    # Extract ke /
+    tar -xzf /tmp/${LATEST} -C /
+
+    # Hapus file temp
+    rm -f /tmp/${LATEST}
+
+    echo "[INFO] Restore selesai dari: ${LATEST}"
+```
+
+```bash
+kubectl apply -f jenkins-backup-scripts.yaml
+```
+
 ### Step 4: Buat Custom Resource Jenkins
 
 ```yaml
@@ -474,7 +577,7 @@ spec:
   master:
     disableCSRFProtection: false
     executorCount: 0
-    maxParallelAgents: 10  # maksimal 10 agent pod berjalan bersamaan
+    maxParallelAgents: 10
     containers:
       - name: jenkins-master
         image: jenkins/jenkins:2.555.3-lts-jdk21
@@ -492,6 +595,59 @@ spec:
               -Xmx1500m
               -XX:MaxRAMFraction=1
               -Djenkins.install.runSetupWizard=false
+        volumeMounts:
+          - name: jenkins-home
+            mountPath: /var/jenkins_home
+
+      - name: backup
+        image: amazon/aws-cli:2.27.8
+        command:
+          - /bin/sh
+          - -c
+          - "while true; do sleep 3600; done"
+        env:
+          - name: AWS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: jenkins-aws-s3
+                key: AWS_ACCESS_KEY_ID
+          - name: AWS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: jenkins-aws-s3
+                key: AWS_SECRET_ACCESS_KEY
+          - name: AWS_DEFAULT_REGION
+            valueFrom:
+              secretKeyRef:
+                name: jenkins-aws-s3
+                key: AWS_DEFAULT_REGION
+          - name: S3_BUCKET
+            valueFrom:
+              secretKeyRef:
+                name: jenkins-aws-s3
+                key: S3_BUCKET
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "300m"
+            memory: "256Mi"
+        volumeMounts:
+          - name: jenkins-home
+            mountPath: /var/jenkins_home
+          - name: backup-scripts
+            mountPath: /bin/backup.sh
+            subPath: backup.sh
+          - name: backup-scripts
+            mountPath: /bin/restore.sh
+            subPath: restore.sh
+
+    volumes:
+      - name: backup-scripts
+        configMap:
+          name: jenkins-backup-scripts
+          defaultMode: 0755
 
     plugins:
       - name: kubernetes
