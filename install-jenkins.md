@@ -347,6 +347,7 @@ persistence:
 
 agent:
   enabled: true
+  maxConcurrent: 10  # maksimal 10 agent pod berjalan bersamaan
   resources:
     requests:
       cpu: "200m"
@@ -354,6 +355,9 @@ agent:
     limits:
       cpu: "500m"
       memory: "512Mi"
+
+controller:
+  numExecutors: 0  # master tidak eksekusi job langsung, semua ke agent
 
 rbac:
   create: true
@@ -469,6 +473,8 @@ spec:
 
   master:
     disableCSRFProtection: false
+    executorCount: 0
+    maxParallelAgents: 10  # maksimal 10 agent pod berjalan bersamaan
     containers:
       - name: jenkins-master
         image: jenkins/jenkins:lts
@@ -601,3 +607,71 @@ kubectl logs pod/jenkins-jenkins-0 -n jenkins -f
 - **Staging / Kecil** → Kubernetes YAML
 - **Production** → Helm (lebih fleksibel dan mudah upgrade)
 - **Enterprise / Production besar** → Jenkins Operator (full lifecycle management)
+
+---
+
+## Konfigurasi Max Agent Pod (Limit 10)
+
+### Helm — via `values.yaml`
+
+Sudah dikonfigurasi di `values.yaml` pada Metode 3:
+
+```yaml
+agent:
+  maxConcurrent: 10
+
+controller:
+  numExecutors: 0
+```
+
+### Kubernetes YAML — via Jenkins UI / JCasC
+
+Jika install menggunakan Kubernetes YAML manual, set limit lewat Jenkins UI:
+
+1. Masuk ke **Manage Jenkins → Clouds → Kubernetes**
+2. Set **Max concurrent agents**: `10`
+3. Klik **Save**
+
+Atau via ConfigMap JCasC:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jenkins-casc
+  namespace: jenkins
+data:
+  jenkins.yaml: |
+    jenkins:
+      numExecutors: 0
+    clouds:
+      - kubernetes:
+          name: "kubernetes"
+          serverUrl: "https://kubernetes.default.svc"
+          namespace: "jenkins"
+          maxRequestsPerHostStr: "10"
+          containerCapStr: "10"
+          templates:
+            - name: "jenkins-agent"
+              namespace: "jenkins"
+              label: "jenkins-agent"
+              containers:
+                - name: "jnlp"
+                  image: "jenkins/inbound-agent:latest"
+                  resourceRequestCpu: "200m"
+                  resourceRequestMemory: "256Mi"
+                  resourceLimitCpu: "500m"
+                  resourceLimitMemory: "512Mi"
+```
+
+```bash
+kubectl apply -f jenkins-casc.yaml -n jenkins
+```
+
+### Rangkuman Pod Count
+
+| Kondisi | Master Pod | Agent Pod | Total |
+|---------|-----------|-----------|-------|
+| Idle | 1 | 0 | **1** |
+| Ada build berjalan | 1 | 1–10 | **2–11** |
+| Full capacity | 1 | 10 | **11** |
